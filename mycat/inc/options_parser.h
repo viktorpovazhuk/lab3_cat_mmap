@@ -59,6 +59,7 @@ public:
 
     std::vector<std::string> files;
     bool print_trans = false;
+    std::string out_file = "out.txt";
 };
 
 #endif //OPTIONS_PARSER_CONFIG_FILE_H

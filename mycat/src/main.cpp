@@ -17,43 +17,10 @@
 #include <cctype>
 #include <cstring>
 #include <iomanip>
+#include <sys/mman.h>
+#include <cmath>
 
 using uniq_char_ptr = std::unique_ptr<char[]>;
-
-void print_buffer(uniq_char_ptr &buf, size_t buf_size) {
-    size_t total_wrote = 0;
-    size_t cur_wrote;
-    while (total_wrote < buf_size) {
-        cur_wrote = write(STDOUT_FILENO, &buf[total_wrote], buf_size - total_wrote);
-        if (cur_wrote == -1) {
-            if (errno == EINTR) {
-                continue;
-            } else {
-                perror("Error while printing buffer");
-                exit(errno);
-            }
-        }
-        total_wrote += cur_wrote;
-    }
-}
-
-size_t read_buffer(int fd, uniq_char_ptr &buf_ptr, size_t buf_capacity) {
-    size_t total_read = 0;
-    size_t cur_read = 1;
-    while (cur_read != 0 and total_read < buf_capacity) {
-        cur_read = read(fd, buf_ptr.get(), buf_capacity - total_read);
-        if (cur_read == -1) {
-            if (errno == EINTR) {
-                continue;
-            } else {
-                perror("Error while reading file in buffer");
-                exit(errno);
-            }
-        }
-        total_read += cur_read;
-    }
-    return total_read;
-}
 
 size_t convert_invisible_chars(uniq_char_ptr &buf_ptr, size_t buf_size, uniq_char_ptr &inv_chars_buf) {
     size_t len_with_repr = 0;
@@ -74,6 +41,71 @@ size_t convert_invisible_chars(uniq_char_ptr &buf_ptr, size_t buf_size, uniq_cha
     return len_with_repr;
 }
 
+size_t write_file(int in_fd, int out_fd, size_t out_size, bool print_inv) {
+    size_t page_size = sysconf(_SC_PAGE_SIZE);
+    const size_t buf_capacity = page_size * 100;
+    const size_t exp_buf_capacity = buf_capacity * 4;
+    auto buf_ptr = std::make_unique<char[]>(buf_capacity);
+    auto exp_buf_ptr = std::make_unique<char[]>(exp_buf_capacity);
+
+    struct stat stat_buf{};
+    fstat(in_fd, &stat_buf);
+    size_t in_size = stat_buf.st_size;
+
+    size_t exp_in_size;
+    if (print_inv) {
+        exp_in_size = in_size * 4;
+    }
+    else {
+        exp_in_size = in_size;
+    }
+    ftruncate(out_fd, out_size + exp_in_size);
+
+    size_t out_off = out_size;
+    size_t in_off = 0;
+    void *in_addr, *out_addr;
+    while (in_off < in_size) {
+        size_t paged_off = ceil(out_off / page_size) * page_size;
+        size_t paged_rem = out_off % page_size;
+        size_t buf_size = buf_capacity;
+        size_t rest_size = in_size - in_off;
+        if (buf_size > rest_size) {
+            buf_size = rest_size;
+        }
+
+        in_addr = mmap(nullptr, buf_size, PROT_READ | PROT_WRITE, MAP_SHARED, in_fd, in_off);
+        if (in_addr == MAP_FAILED) {
+            perror("input mmap");
+        }
+        memcpy(buf_ptr.get(), in_addr, buf_size);
+
+        size_t exp_buf_size;
+        if (print_inv) {
+            exp_buf_size = convert_invisible_chars(buf_ptr, buf_size, exp_buf_ptr);
+        }
+        else {
+            exp_buf_size = buf_size;
+            memcpy(exp_buf_ptr.get(), buf_ptr.get(), buf_size);
+        }
+        out_addr = mmap(nullptr, paged_rem + exp_buf_size, PROT_READ | PROT_WRITE, MAP_SHARED, out_fd, paged_off);
+        if (out_addr == MAP_FAILED) {
+            perror("output mmap");
+        }
+        memcpy(static_cast<char *>(out_addr) + paged_rem, exp_buf_ptr.get(), exp_buf_size);
+        msync(out_addr, paged_rem + exp_buf_size, MS_SYNC);
+
+        munmap(in_addr, buf_size);
+        munmap(out_addr, buf_size);
+
+        in_off += buf_size;
+        out_off += exp_buf_size;
+    }
+    size_t new_size = out_off;
+    ftruncate(out_fd, new_size);
+
+    return new_size;
+}
+
 int main(int argc, char *argv[]) {
     std::unique_ptr<command_line_options_t> command_line_options;
     try {
@@ -85,36 +117,31 @@ int main(int argc, char *argv[]) {
     }
     std::vector<std::string> paths = command_line_options->files;
     bool print_inv = command_line_options->print_trans;
+    std::string out_path = command_line_options->out_file;
 
-    const size_t buf_capacity = 10e6;
-    auto buf_ptr = std::make_unique<char[]>(buf_capacity);
-    auto inv_chars_buf_ptr = std::make_unique<char[]>(buf_capacity*4);
-
-    std::vector<int> fds(paths.size());
+    std::vector<int> in_fds(paths.size());
     for (size_t i = 0; i < paths.size(); i++) {
         std::string &cur_path = paths[i];
-        int cur_fd = open(cur_path.c_str(), O_RDONLY);
+        int cur_fd = open(cur_path.c_str(), O_RDWR);
         if (cur_fd == -1) {
             perror(("Error while opening file: " + cur_path).c_str());
             exit(errno);
         }
-        fds[i] = cur_fd;
+        in_fds[i] = cur_fd;
+    }
+    int out_fd = open(out_path.c_str(), O_RDWR);
+    if (out_fd == -1) {
+        perror(("Error while opening file: " + out_path).c_str());
+        exit(errno);
     }
 
-    for (int fd: fds) {
-        size_t read_buf_size = buf_capacity;
-        while (read_buf_size == buf_capacity) {
-            read_buf_size = read_buffer(fd, buf_ptr, buf_capacity);
-            if (print_inv) {
-                size_t inv_buf_size = convert_invisible_chars(buf_ptr, read_buf_size, inv_chars_buf_ptr);
-                print_buffer(inv_chars_buf_ptr, inv_buf_size);
-            } else {
-                print_buffer(buf_ptr, read_buf_size);
-            }
-        }
+    ftruncate(out_fd, 0);
+    size_t out_size = 0;
+    for (int in_fd: in_fds) {
+        out_size = write_file(in_fd, out_fd, out_size, print_inv);
     }
 
-    for (int fd: fds) {
+    for (int fd: in_fds) {
         int res = close(fd);
         if (res == -1) {
             perror("Error while closing file");

@@ -19,7 +19,10 @@ command_line_options_t::command_line_options_t() {
             ("files",
              po::value<std::vector<std::string>>()->
              multitoken()->zero_tokens()->composing(),
-             "Files to send in output");
+             "Files to send in output")
+            ("out,o",
+             po::value<std::string>(),
+             "Output file");
 
     positional_opt.add("files", -1);
 }
@@ -51,6 +54,13 @@ void command_line_options_t::parse(int ac, char **av) {
         }
         else {
             throw OptionsParseException("Specify files");
+        }
+
+        if (var_map.count("out") > 0) {
+            out_file = var_map["out"].as<std::string>();
+        }
+        else {
+            throw OptionsParseException("Specify output file");
         }
     } catch (std::exception &ex) {
         throw OptionsParseException(ex.what()); // Convert to our error type
