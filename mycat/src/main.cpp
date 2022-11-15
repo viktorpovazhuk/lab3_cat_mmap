@@ -49,7 +49,10 @@ size_t write_file(int in_fd, int out_fd, size_t out_size, bool print_inv) {
     auto exp_buf_ptr = std::make_unique<char[]>(exp_buf_capacity);
 
     struct stat stat_buf{};
-    fstat(in_fd, &stat_buf);
+    if (fstat(in_fd, &stat_buf) == -1) {
+        perror("stat");
+        exit(errno);
+    }
     size_t in_size = stat_buf.st_size;
 
     size_t exp_in_size;
@@ -59,7 +62,10 @@ size_t write_file(int in_fd, int out_fd, size_t out_size, bool print_inv) {
     else {
         exp_in_size = in_size;
     }
-    ftruncate(out_fd, out_size + exp_in_size);
+    if (ftruncate(out_fd, out_size + exp_in_size) == -1) {
+        perror("enlarging ftruncate");
+        exit(errno);
+    }
 
     size_t out_off = out_size;
     size_t in_off = 0;
@@ -76,6 +82,7 @@ size_t write_file(int in_fd, int out_fd, size_t out_size, bool print_inv) {
         in_addr = mmap(nullptr, buf_size, PROT_READ | PROT_WRITE, MAP_SHARED, in_fd, in_off);
         if (in_addr == MAP_FAILED) {
             perror("input mmap");
+            exit(errno);
         }
         memcpy(buf_ptr.get(), in_addr, buf_size);
 
@@ -87,21 +94,35 @@ size_t write_file(int in_fd, int out_fd, size_t out_size, bool print_inv) {
             exp_buf_size = buf_size;
             memcpy(exp_buf_ptr.get(), buf_ptr.get(), buf_size);
         }
-        out_addr = mmap(nullptr, paged_rem + exp_buf_size, PROT_READ | PROT_WRITE, MAP_SHARED, out_fd, paged_off);
+        size_t paged_exp_buf_size = paged_rem + exp_buf_size;
+        out_addr = mmap(nullptr, paged_exp_buf_size, PROT_READ | PROT_WRITE, MAP_SHARED, out_fd, paged_off);
         if (out_addr == MAP_FAILED) {
             perror("output mmap");
+            exit(errno);
         }
         memcpy(static_cast<char *>(out_addr) + paged_rem, exp_buf_ptr.get(), exp_buf_size);
-        msync(out_addr, paged_rem + exp_buf_size, MS_SYNC);
+        if (msync(out_addr, paged_exp_buf_size, MS_SYNC) == -1) {
+            perror("msync");
+            exit(errno);
+        }
 
-        munmap(in_addr, buf_size);
-        munmap(out_addr, buf_size);
+        if (munmap(in_addr, buf_size) == -1) {
+            perror("in_addr munmap");
+            exit(errno);
+        }
+        if (munmap(out_addr, paged_exp_buf_size) == -1) {
+            perror("out_addr munmap");
+            exit(errno);
+        }
 
         in_off += buf_size;
         out_off += exp_buf_size;
     }
     size_t new_size = out_off;
-    ftruncate(out_fd, new_size);
+    if (ftruncate(out_fd, new_size) == -1) {
+        perror("shrinking ftruncate");
+        exit(errno);
+    }
 
     return new_size;
 }
@@ -129,13 +150,12 @@ int main(int argc, char *argv[]) {
         }
         in_fds[i] = cur_fd;
     }
-    int out_fd = open(out_path.c_str(), O_RDWR);
+    int out_fd = open(out_path.c_str(), O_RDWR | O_CREAT | O_TRUNC, S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP);
     if (out_fd == -1) {
         perror(("Error while opening file: " + out_path).c_str());
         exit(errno);
     }
 
-    ftruncate(out_fd, 0);
     size_t out_size = 0;
     for (int in_fd: in_fds) {
         out_size = write_file(in_fd, out_fd, out_size, print_inv);
